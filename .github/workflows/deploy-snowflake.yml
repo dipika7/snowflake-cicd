@@ -1,0 +1,89 @@
+name: Snowflake CI/CD Deployment
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_call:
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+      AWS_REGION:
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      DEPLOYMENT_ENV: ${{ github.ref_name }}
+
+    steps:
+      # Step 1: Checkout Code
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # Step 2: Set up AWS Credentials using GitHub Secrets
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_NUMBER }}:role/asset-github-actions-${{ env.DEPLOYMENT_ENV }}
+          role-session-name: GithubActions
+
+      # Step 3: Install JQ (if not available)
+      - name: Install jq
+        run: sudo apt-get install -y jq
+
+      # Step 4: Install SnowSQL
+      - name: Install SnowSQL
+        run: |
+          wget https://sfc-repo.snowflakecomputing.com/snowsql/bootstrap/1.3/linux_x86_64/snowsql-1.3.2-linux_x86_64.bash -O snowsql_install.bash
+          chmod +x snowsql_install.bash
+          yes | ./snowsql_install.bash
+
+      # Step 5: Verify SnowSQL Installation
+      - name: Verify SnowSQL Installation
+        run: |
+          /home/runner/.snowsql/1.3.2/snowsql --version
+          ls -l /home/runner/.snowsql/1.3.2/snowsql
+
+      # Step 6: Fetch Snowflake Credentials from AWS Secrets Manager
+      - name: Load Snowflake Credentials
+        id: load-creds
+        run: |
+          SECRET_NAME="mt-${DEPLOYMENT_ENV}-asset-snowflake-new"
+          echo "Fetching secret: $SECRET_NAME"
+          SNOWFLAKE_SECRET=$(aws secretsmanager get-secret-value --secret-id "$SECRET_NAME" --query SecretString --output text)
+
+          echo "SNOWSQL_ACCOUNT=$(echo "$SNOWFLAKE_SECRET" | jq -r '.account')" >> $GITHUB_ENV
+          echo "SNOWSQL_USER=$(echo "$SNOWFLAKE_SECRET" | jq -r '.user')" >> $GITHUB_ENV
+          echo "SNOWSQL_PWD=$(echo "$SNOWFLAKE_SECRET" | jq -r '.password')" >> $GITHUB_ENV
+          echo "SNOWSQL_DATABASE=$(echo "$SNOWFLAKE_SECRET" | jq -r '.database')" >> $GITHUB_ENV
+          echo "SNOWSQL_WAREHOUSE=$(echo "$SNOWFLAKE_SECRET" | jq -r '.warehouse')" >> $GITHUB_ENV
+          echo "SNOWSQL_ROLE=$(echo "$SNOWFLAKE_SECRET" | jq -r '.role')" >> $GITHUB_ENV
+          echo "SNOWSQL_SCHEMA=$(echo "$SNOWFLAKE_SECRET" | jq -r '.schema')" >> $GITHUB_ENV
+
+      # Step 7: Deploy SQL Scripts
+      - name: Deploy SQL Scripts to Snowflake
+        run: |
+          DEPLOY_DIR="sql/${DEPLOYMENT_ENV}"
+          echo "Deploying all .sql files from $DEPLOY_DIR"
+
+          for file in $DEPLOY_DIR/*.sql; do
+            echo "Running $file"
+            /home/runner/.snowsql/1.3.2/snowsql \
+              -a "$SNOWSQL_ACCOUNT" \
+              -u "$SNOWSQL_USER" \
+              -r "$SNOWSQL_ROLE" \
+              -w "$SNOWSQL_WAREHOUSE" \
+              -d "$SNOWSQL_DATABASE" \
+              -s "$SNOWSQL_SCHEMA" \
+              -f "$file" \
+              -o log_level=DEBUG
+          done
