@@ -2,12 +2,14 @@ name: Snowflake CI/CD Deployment
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   pull_request:
-    branches:
-      - main
+    branches: [main]
   workflow_call:
+    inputs:
+      AWS_ACCOUNT_NUMBER:
+        required: true
+        type: string
     secrets:
       AWS_ACCESS_KEY_ID:
         required: true
@@ -22,44 +24,47 @@ jobs:
 
     env:
       DEPLOYMENT_ENV: ${{ github.ref_name }}
+      SNOWSQL_VERSION: 1.3.2  # You can update this as needed
 
     steps:
       # Step 1: Checkout Code
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # Step 2: Set up AWS Credentials using GitHub Secrets
+      # Step 2: Configure AWS Credentials
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-region: ${{ env.AWS_REGION }}
-          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_NUMBER }}:role/asset-github-actions-${{ env.DEPLOYMENT_ENV }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          role-to-assume: arn:aws:iam::${{ inputs.AWS_ACCOUNT_NUMBER }}:role/asset-github-actions-${{ env.DEPLOYMENT_ENV }}
           role-session-name: GithubActions
 
-      # Step 3: Install JQ (if not available)
+      # Step 3: Install jq
       - name: Install jq
         run: sudo apt-get install -y jq
 
-      # Step 4: Install SnowSQL
+      # Step 4: Install SnowSQL CLI
       - name: Install SnowSQL
         run: |
-          wget https://sfc-repo.snowflakecomputing.com/snowsql/bootstrap/1.3/linux_x86_64/snowsql-1.3.2-linux_x86_64.bash -O snowsql_install.bash
+          curl -o snowsql_install.bash \
+            https://sfc-repo.snowflakecomputing.com/snowsql/bootstrap/${SNOWSQL_VERSION}/linux_x86_64/snowsql-${SNOWSQL_VERSION}-linux_x86_64.bash
           chmod +x snowsql_install.bash
           yes | ./snowsql_install.bash
 
       # Step 5: Verify SnowSQL Installation
-      - name: Verify SnowSQL Installation
+      - name: Verify SnowSQL
         run: |
-          /home/runner/.snowsql/1.3.2/snowsql --version
-          ls -l /home/runner/.snowsql/1.3.2/snowsql
+          /home/runner/.snowsql/${SNOWSQL_VERSION}/snowsql --version
 
-      # Step 6: Fetch Snowflake Credentials from AWS Secrets Manager
+      # Step 6: Load Snowflake Credentials from AWS Secrets Manager
       - name: Load Snowflake Credentials
         id: load-creds
         run: |
-          SECRET_NAME="mt-${DEPLOYMENT_ENV}-asset-snowflake-new"
-          echo "Fetching secret: $SECRET_NAME"
-          SNOWFLAKE_SECRET=$(aws secretsmanager get-secret-value --secret-id "$SECRET_NAME" --query SecretString --output text)
+          SECRET_NAME="snowflake-${DEPLOYMENT_ENV}-credentials"  # Adjust your secret naming here
+          SNOWFLAKE_SECRET=$(aws secretsmanager get-secret-value \
+            --secret-id "$SECRET_NAME" \
+            --query SecretString \
+            --output text)
 
           echo "SNOWSQL_ACCOUNT=$(echo "$SNOWFLAKE_SECRET" | jq -r '.account')" >> $GITHUB_ENV
           echo "SNOWSQL_USER=$(echo "$SNOWFLAKE_SECRET" | jq -r '.user')" >> $GITHUB_ENV
@@ -69,21 +74,22 @@ jobs:
           echo "SNOWSQL_ROLE=$(echo "$SNOWFLAKE_SECRET" | jq -r '.role')" >> $GITHUB_ENV
           echo "SNOWSQL_SCHEMA=$(echo "$SNOWFLAKE_SECRET" | jq -r '.schema')" >> $GITHUB_ENV
 
-      # Step 7: Deploy SQL Scripts
+      # Step 7: Deploy SQL Scripts to Snowflake
       - name: Deploy SQL Scripts to Snowflake
         run: |
           DEPLOY_DIR="sql/${DEPLOYMENT_ENV}"
-          echo "Deploying all .sql files from $DEPLOY_DIR"
+          echo "Deploying .sql files from $DEPLOY_DIR"
 
           for file in $DEPLOY_DIR/*.sql; do
             echo "Running $file"
-            /home/runner/.snowsql/1.3.2/snowsql \
+            /home/runner/.snowsql/${SNOWSQL_VERSION}/snowsql \
               -a "$SNOWSQL_ACCOUNT" \
               -u "$SNOWSQL_USER" \
+              -p "$SNOWSQL_PWD" \
               -r "$SNOWSQL_ROLE" \
               -w "$SNOWSQL_WAREHOUSE" \
               -d "$SNOWSQL_DATABASE" \
               -s "$SNOWSQL_SCHEMA" \
               -f "$file" \
-              -o log_level=DEBUG
+              -o log_level=INFO
           done
